@@ -1,6 +1,13 @@
-{ nodejs, stdenv, mkShell, lib, fetchurl, writeText, writeTextFile, runCommand }:
-rec {
+{ nodejs, stdenv, mkShell, lib, fetchurl, writeText, writeTextFile, runCommand, callPackage }:
+let self = rec {
   default_nodejs = nodejs;
+
+  yarn = callPackage ./yarn.nix { internal = self; };
+
+  # Description: Replace all "bad" characters (those that aren't allowed in nix paths) with underscores.
+  # Type: String -> String
+  makeSafeName = name:
+    lib.substring 0 20 (lib.replaceStrings ["@" "/" "^" "\"" "," " " "~" "|" ">" "<" "*"] ["_" "_" "_" "_" "_" "_" "_" "_" "_" "_" "_"] name);
 
   # Description: Turns an npm lockfile dependency into an attribute set as needed by fetchurl
   # Type: String -> Set -> Set
@@ -8,6 +15,7 @@ rec {
     assert !(dependency ? resolved) -> builtins.throw "Missing `resolved` attribute for dependency `${name}`.";
     assert !(dependency ? integrity) -> builtins.throw "Missing `integrity` attribute for dependency `${name}`.";
     {
+      name = makeSafeName name;
       url = dependency.resolved;
       # FIXME: for backwards compatibility we should probably set the
       #        `sha1`, `sha256`, `sha512` … attributes depending on the string
@@ -20,7 +28,10 @@ rec {
   makeSource = name: dependency:
     assert (builtins.typeOf name != "string") -> builtins.throw "Name of dependency ${toString name} must be a string";
     assert (builtins.typeOf dependency != "set") -> builtins.throw "Specification of dependency ${toString name} must be a set";
-    fetchurl (makeSourceAttrs name dependency);
+    if dependency ? integrity then
+    fetchurl (makeSourceAttrs name dependency)
+
+    else builtins.fetchurl dependency.resolved;
 
   # Description: Parses the lock file as json and returns an attribute set
   # Type: Path -> Set
@@ -55,7 +66,7 @@ rec {
   # Description: Takes a Path to a lockfile and returns the patched version as attribute set
   # Type: Path -> Set
   patchLockfile = file:
-    assert (builtins.typeOf file != "path") -> builtins.throw "file ${toString file} must a path";
+#    assert (builtins.typeOf file != "path") -> builtins.throw "file ${toString file} must a path";
     let content = readLockfile file; in
     content // {
       dependencies = lib.mapAttrs patchDependency content.dependencies;
@@ -102,8 +113,19 @@ rec {
     in
     (getAttrs [ "src" "nodejs" ] attrs // node_modules_attrs);
 
+  # Filters the given src to only contain the `package.json` files.
+  # This makes it possible to strip down the build dependencies of e.g.
+  # node_modules to just the relevant pieces.
+  onlyPackageJsonFilter = src: lib.cleanSourceWith {
+    filter = name: type:
+      let basename = baseNameOf name; in basename == "package.json";
+    inherit src;
+  };
+
   node_modules =
     { src
+    , filterSource ? true
+    , sourceFilter ? onlyPackageJsonFilter
     , packageJson ? src + "/package.json"
     , packageLockJson ? src + "/package-lock.json"
     , buildInputs ? [ ]
@@ -115,6 +137,7 @@ rec {
     , ...
     }@args:
       assert (builtins.typeOf preInstallLinks != "set") -> throw "`preInstallLinks` must be an attributeset of attributesets";
+      assert !(builtins.pathExists packageLockJson) -> throw "the defined `packageLockJson` file doesn't exist. Is your `src` (or `packageLockJson`) attribute pointing to the right place?";
       let
         lockfile = readLockfile packageLockJson;
 
@@ -151,8 +174,10 @@ rec {
       in
       stdenv.mkDerivation (extraArgs // {
         inherit (lockfile) version;
-        pname = lockfile.name;
-        inherit src buildInputs preBuild postBuild;
+        pname = makeSafeName lockfile.name;
+        inherit buildInputs preBuild postBuild;
+
+        src = if filterSource then sourceFilter src else src;
 
         nativeBuildInputs = nativeBuildInputs ++ [
           nodejs
@@ -163,7 +188,7 @@ rec {
         ];
 
         setupHooks = [
-          ./set-node-path.sh
+          ./set-paths.sh
         ];
 
         preConfigure = ''
@@ -224,11 +249,12 @@ rec {
     , buildCommands ? [ "npm run build" ]
     , installPhase
     , node_modules_mode ? "symlink"
+    , node_modules ? null
     , buildInputs ? [ ]
     , ...
     }@attrs:
     let
-      nm = node_modules (get_node_modules_attrs attrs);
+      nm = if node_modules != null then node_modules else self.node_modules (get_node_modules_attrs attrs);
       extraAttrs = builtins.removeAttrs attrs [ "node_modules_attrs" ];
     in
     stdenv.mkDerivation ({
@@ -244,5 +270,10 @@ rec {
         ${lib.concatStringsSep "\n" buildCommands}
         runHook postBuild
       '';
+
+      passthru = {
+        node_modules = nm;
+        inherit (nm) nodejs;
+      };
     } // extraAttrs);
-}
+}; in self
